@@ -1,0 +1,672 @@
+﻿using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+
+
+namespace YAHBackup
+{
+    struct DestinationFile
+    {
+        public string destDrive;
+        public string timestamp;
+        public string fileName;
+        public string driveTimeFilename;
+    }
+
+    class CopyModule
+    {
+        const int ERROR_SHARING_VIOLATION = 32;
+        const int ERROR_LOCK_VIOLATION = 33;
+
+        private Config cfg;
+        private string now;
+        List<String> sourceFileList;
+        List<String> sourceDirList;
+        List<DestinationFile> destFileList;
+        List<String> destDirList;
+
+        private CancellationToken cancellationToken;
+
+        public CopyModule(Config cfg, CancellationToken token)
+        {
+            this.cfg = cfg;
+
+            this.cancellationToken = token;
+
+            this.now = DateTime.Now.ToString("yyyyMMddHHmm");
+            this.sourceFileList = new List<String>();
+            this.sourceDirList = new List<String>();
+            this.destFileList = new List<DestinationFile>();
+            this.destDirList = new List<String>();
+        }
+
+        public List<String> createDirectoryList() {
+
+            cfg.addToLog("creating list of directories ... ");
+            
+            List<String> dirs = new List<String>();
+            // first check provided source directory and all subdirectories, if required
+            if (cfg.copySubDirectories)
+            {
+                Stack<string> dir_stack = new Stack<string>(20);
+                foreach(string absDir in cfg.absInputDirectories)
+                {
+                    dir_stack.Push(absDir);
+                }
+
+                List<string> subdirs;
+                while (dir_stack.Count > 0)
+                {
+                    string currentDir = dir_stack.Pop();
+                    try
+                    {
+                        subdirs = new List<string>(Directory.EnumerateDirectories(currentDir));
+                        string currentDirName = new DirectoryInfo(currentDir).Name;
+                        bool addDir = true;
+                        if (!cfg.copyAll)
+                        {
+                            foreach (string commonDir in cfg.commonDirsToIgnore)
+                            {
+                                // like ".Contains" but case insensitive
+                                if (currentDir.IndexOf(commonDir, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    addDir = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (addDir)
+                        {
+                            dirs.Add(currentDir);
+                        } else
+                        {
+                            if(cfg.verboseMode)
+                            {
+                                cfg.addToLog(currentDir + ": skipping");
+                            }
+                        }
+                    }
+                    catch (ArgumentException e)
+                    {
+                        cfg.addToLog("ERR:" + currentDir + ":" + e.Message);
+                        continue;
+                    }
+                    catch (DirectoryNotFoundException e)
+                    {
+                        cfg.addToLog("ERR:" + currentDir + ":" + e.Message);
+                        continue;
+                    }
+                    catch (IOException e)
+                    {
+                        cfg.addToLog("ERR:" + currentDir + ":" + e.Message);
+                        continue;
+                    }
+                    catch (System.Security.SecurityException e)
+                    {
+                        cfg.addToLog("ERR:" + currentDir + ":" + e.Message);
+                        continue;
+                    }
+                    catch (UnauthorizedAccessException e)
+                    {
+                        cfg.addToLog("ERR:" + currentDir + ":" + e.Message);                        
+                        continue;
+                    }
+                    foreach (string str in subdirs)
+                    {
+                        dir_stack.Push(str);
+                    }
+                }
+            } else
+            {
+                foreach (string absDir in cfg.absInputDirectories)
+                {
+                    dirs.Add(absDir);
+                }
+            }
+
+            // filter directories according to input given
+            List<String> dirs_filtered = new List<String>();
+            foreach (string dir_i in dirs)
+            {
+                bool addDir = true;
+                foreach (string pattern_i in cfg.directoriesToIgnore)
+                {
+                    if (dir_i.IndexOf(pattern_i, StringComparison.OrdinalIgnoreCase) >= 0)
+                    //if (dir_i.Contains(pattern_i))
+                    {
+                        addDir = false;
+                        break;
+                    }
+                }
+                if (addDir)
+                {
+                    dirs_filtered.Add(dir_i);
+                } else
+                {
+                    if (cfg.verboseMode)
+                    {
+                        cfg.addToLog(dir_i + ": skipping");
+                    }
+                }
+            }
+            cfg.addToLog("creating list of directories ... DONE");
+            return dirs_filtered;
+        }
+
+        public void createFileList(List<String> inputDirList) {
+
+            cfg.addToLog("creating list of files ... ");
+
+            foreach (string dir_i in inputDirList)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    cfg.addToLog("Copy aborted by user.");
+                    return;
+                }
+
+                try
+                {
+                    this.destDirList.Add(this.createDirDestPath(dir_i, cfg.destinationDirectory));
+                    sourceDirList.Add(dir_i);
+                }
+                catch (System.IO.PathTooLongException e)
+                {
+                    this.cfg.addToLog("ERR:" + dir_i + ": " + e.Message);
+                    continue;
+                }
+
+                string[] files_dir_i = System.IO.Directory.GetFiles(dir_i);
+                foreach (string file_i in files_dir_i)
+                {
+                    bool addFile = false;
+                    string file_i_pure = System.IO.Path.GetFileName(file_i);
+                    
+                    // only add those files that are in our extension list
+                    if (cfg.fileEndings.Count() > 0)
+                    {
+                        foreach (string pattern_i in cfg.fileEndings)
+                        {
+                            if (this.Like(file_i_pure, pattern_i))
+                            {
+                                addFile = true;
+                                break;
+                            }
+                        }
+                    } else // otherwise take file
+                    {
+                        addFile = true;
+                    }
+                    
+                    if (cfg.filePatternsToIgnore.Count > 0 && addFile == true)
+                    {
+                        foreach (string pattern_i in cfg.filePatternsToIgnore)
+                        {
+                            if (this.Like(file_i_pure, pattern_i))
+                            {
+                                addFile = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if(!cfg.copyAll)
+                    {
+                        foreach (string pattern_i in cfg.commonFilePatternsToIgnore)
+                        {   
+                            // in our common File patterns, we also have full file names like "hiberfil.sys"
+                            // hence we must also check equality
+                            if (this.Like(file_i_pure, pattern_i) || string.Equals(file_i_pure, pattern_i))
+                            {   
+                                addFile = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (addFile)
+                    {
+
+                        try
+                        {
+                            this.destFileList.Add(this.createFileDestPath(file_i, cfg.destinationDirectory));
+                            this.sourceFileList.Add(file_i);
+                        } catch (System.IO.PathTooLongException e)
+                        {
+                            this.cfg.addToLog("ERR:" + file_i + ": " + e.Message);
+                        }
+                    } else
+                    {
+                        if (cfg.verboseMode)
+                        {
+                            cfg.addToLog(file_i + ": skipping");
+                        }
+                    }
+                }
+            }
+            cfg.addToLog("creating list of files ... DONE");
+        }
+
+        public Tuple<string, string> getLastDir(string destDirectory)
+        {
+            try
+            {
+                string[] dirs = System.IO.Directory.GetDirectories(destDirectory);
+                List<Tuple<string,string>> numberDirs = new List<Tuple<string,string>>();
+                foreach (string dir_i in dirs)
+                {
+                    DirectoryInfo f = new DirectoryInfo(dir_i);
+                    string src_drive = Path.GetPathRoot(f.FullName);
+                    //string dir_i_wo_drive = dir_i.Substring(src_drive.Length-1, dir_i.Length - src_drive.Length+1);
+                    string dir_i_wo_drive = f.Name;
+
+                    //Console.WriteLine("checking dir_i " + dir_i_wo_drive);
+
+                    if(this.IsDigitsOnly(dir_i_wo_drive))
+                    {
+                        //Console.WriteLine("dir_i_wo_drive: " + dir_i_wo_drive);
+                        numberDirs.Add(new Tuple<string,string>(dir_i, dir_i_wo_drive));
+                    }
+                }
+                numberDirs.Sort();
+                numberDirs.Reverse();
+                if(numberDirs.Count > 0)
+                {
+                    return numberDirs[0];
+                } else
+                {
+                    throw new ArgumentException();
+                }
+
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                this.cfg.addToLog("ERR:" + destDirectory + ": " + e.Message);
+                throw new ArgumentException();
+            }
+            catch (DirectoryNotFoundException e)
+            {
+                this.cfg.addToLog("ERR:" + destDirectory + ": " + e.Message);
+                throw new ArgumentException();
+            }
+            catch (PathTooLongException e)
+            {
+                this.cfg.addToLog("ERR:" + destDirectory + ": " + e.Message);
+                throw new ArgumentException();
+            }
+        }
+
+        public void doCopy()
+        {
+            List<Tuple<String, DestinationFile>> tryWithVSS = new List<Tuple<String, DestinationFile>>();
+
+            this.cfg.addToLog("-----------------------------------------------------------------");
+
+            bool foundLastDir = false;
+            string lastBackupDirectory = "";
+            string lastTimestamp = "";
+            try
+            {
+                Tuple<string,string> tpl = this.getLastDir(cfg.destinationDirectory);
+                lastBackupDirectory = tpl.Item1;
+                lastTimestamp = tpl.Item2;
+                this.cfg.addToLog("identified last backup directory: " + lastBackupDirectory);
+                foundLastDir = true;
+            } catch (ArgumentException e)
+            {
+                this.cfg.addToLog("unable to identify a previous backup location, copying all");
+            }
+
+            // first create all target directories
+            foreach (string destDir in this.destDirList)
+            {
+                try
+                {
+                    if (!cfg.dryRun)
+                    {
+                        System.IO.Directory.CreateDirectory(destDir);
+                    }
+                    if (cfg.verboseMode)
+                    {
+                        cfg.addToLog(destDir + ": created");
+                    }
+                    
+                }
+                catch (DirectoryNotFoundException ex)
+                {
+                    this.cfg.addToLog("ERR:" + destDir + ": " + ex.Message);
+                    continue;
+                }
+                catch (NotSupportedException ex)
+                {
+                    this.cfg.addToLog("ERR:" + destDir + ": " + ex.Message);
+                    continue;
+                }
+                catch (PathTooLongException ex)
+                {
+                    this.cfg.addToLog("ERR:" + destDir + ": " + ex.Message);
+                    continue;
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    this.cfg.addToLog("ERR:" + destDir + ": " + ex.Message);
+                    continue;
+                }
+                catch (ArgumentException ex)
+                {
+                    this.cfg.addToLog("ERR:" + destDir + ": " + ex.Message);
+                    continue;
+                }
+                catch (IOException ex)
+                {
+                    this.cfg.addToLog("ERR:" + destDir + ": " + ex.Message);
+                    continue;
+                }
+            }
+
+            //Console.WriteLine("now " + this.now);
+            //Console.WriteLine("now eq backup: " + (this.now == lastTimestamp));
+            if (this.now == lastTimestamp)
+            {
+                this.cfg.addToLog("ERR: Backup folder " + this.now + " already exists. Aborting.");
+                this.cfg.addToLog("-----------------------------------------------------------------");
+                return;
+            }
+
+            // copy all files
+            var sourceDestFiles = this.sourceFileList.Zip(this.destFileList, (a, b) => new { sourceFile = a, destFile = b });
+            int counter = 0;
+            int cntAll = sourceDestFiles.Count();
+            if(cntAll == 0)
+            {
+                cntAll = 1;
+            }
+            int onePercent  = (int) ((float) cntAll / 100.0);            
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            cfg.WriteProgressBar("copying files: ", "", 0);
+
+            foreach (var x in sourceDestFiles)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    cfg.addToLog("Copy aborted by user.");
+                    return;
+                }
+
+                try
+                {
+                    FileInfo fi_source = new FileInfo(x.sourceFile);
+                    bool makeCopy = true;
+                    if (foundLastDir) {
+                        // first check if file exists in old backup
+                        string oldFn = Path.Combine(x.destFile.destDrive, lastBackupDirectory, x.destFile.fileName);
+                        FileInfo fi_backup = new FileInfo(oldFn);
+                        if (fi_backup.Exists)
+                        {
+                            if (fi_source.CreationTimeUtc == fi_backup.CreationTimeUtc &&
+                                fi_source.LastWriteTimeUtc == fi_backup.LastWriteTimeUtc &&
+                                fi_source.Length == fi_backup.Length)
+                            {
+                                if (!cfg.dryRun)
+                                {
+                                    if (File.Exists(x.destFile.driveTimeFilename))
+                                    {
+                                        var fi = new FileInfo(x.destFile.driveTimeFilename);
+                                    }
+
+                                    if (CreateHardLink(x.destFile.driveTimeFilename, oldFn, IntPtr.Zero))
+                                    {
+                                        makeCopy = false;
+                                        if (cfg.verboseMode)
+                                        {
+                                            cfg.addToLog(x.sourceFile + ": creating hardlink to " + oldFn);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        cfg.addToLog(new Win32Exception(Marshal.GetLastWin32Error()).Message);
+                                        cfg.addToLog("ERR:" + x.sourceFile + ": unable to create hardlink, copying instead");
+                                    }
+                                } else
+                                {
+                                    if (cfg.verboseMode)
+                                    {
+                                        cfg.addToLog(x.sourceFile + ": creating hardlink to " + oldFn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!cfg.dryRun)
+                    {
+                        if (makeCopy)
+                        {
+                            try
+                            {
+                                //Console.WriteLine("source filename: " + x.sourceFile);
+                                //Console.WriteLine("copying to: " + x.destFile.driveTimeFilename);
+                                File.Copy(x.sourceFile, x.destFile.driveTimeFilename);
+                                FileInfo fi_dest = new FileInfo(x.destFile.driveTimeFilename);
+                                bool wasReadOnly = false;
+                                if (fi_dest.IsReadOnly)
+                                {
+                                    fi_dest.IsReadOnly = false;
+                                    wasReadOnly = true;
+                                }
+                                fi_dest.CreationTime = fi_source.CreationTime;
+                                fi_dest.LastWriteTime = fi_source.LastWriteTime;
+                                fi_dest.LastAccessTime = fi_source.LastAccessTime;
+                                if (wasReadOnly)
+                                {
+                                    fi_dest.IsReadOnly = true;
+                                }
+                                if (cfg.verboseMode)
+                                {
+                                    cfg.addToLog(x.sourceFile + ": file copied");
+                                }
+                            }
+                            catch (UnauthorizedAccessException unauthEx)
+                            {
+                                cfg.addToLog("ERR: " + x.sourceFile + ": couldn't access file and/or set creation time of destination file");
+                            }
+                            catch (ArgumentException e)
+                            {
+                                cfg.addToLog("ERR: " + x.sourceFile + ": argument exception");
+                            }
+                            catch (PathTooLongException e)
+                            {
+                                cfg.addToLog("ERR: " + x.sourceFile + ": path too long exception");
+                            }
+                            catch (DirectoryNotFoundException e)
+                            {
+                                cfg.addToLog("ERR: " + x.sourceFile + ": directory not found exception");
+                            }
+                            catch (FileNotFoundException e)
+                            {
+                                cfg.addToLog("ERR: " + x.sourceFile + ": file not found exception");
+                            }
+                        }
+                    } else
+                    {
+                        if (cfg.verboseMode)
+                        {
+                            cfg.addToLog(x.sourceFile + ": file copied");
+                        }
+                    }
+                }
+                catch (IOException copyError)
+                {
+                    if (cfg.useVss)
+                    {
+                        int errorCode = Marshal.GetHRForException(copyError) & ((1 << 16) - 1);
+                        if (errorCode == ERROR_SHARING_VIOLATION || errorCode == ERROR_LOCK_VIOLATION)
+                        {
+                            cfg.addToLog("ERR:" + x.sourceFile + ": sharing or lock violation, trying later w/ shadow copy");
+                            Tuple<String, DestinationFile> tpl = new Tuple<String, DestinationFile>(x.sourceFile, x.destFile);
+                            tryWithVSS.Add(tpl);
+                        } else
+                        {
+                            cfg.addToLog("ERR:" + x.sourceFile + ": " + copyError.Message);
+                        }
+
+                    } else
+                    {
+                        cfg.addToLog("ERR:" + x.sourceFile + ": " + copyError.Message);
+                    }
+                }
+                catch(PlatformNotSupportedException e)
+                {
+                    cfg.addToLog("ERR:" + x.sourceFile + ": " + e.Message);
+                }
+                catch (ArgumentOutOfRangeException e)
+                {
+                    cfg.addToLog("ERR:" + x.sourceFile + ": " + e.Message);
+                }
+                counter += 1;
+                if (!cfg.verboseMode)
+                {
+                    if(onePercent == 0)
+                    {
+                        onePercent += 1;
+                    }
+                    if (counter % onePercent == 0)
+                    {
+                        int percent = (int)((((double)counter / (double)cntAll)) * 100.0);
+                        watch.Stop();
+                        long passedSecs = watch.ElapsedMilliseconds / 1000;
+                        double ratio = ((double) cntAll - (double)(counter + 1)) / (double) (counter + 1);
+                        long remSecsTotal = (long)(passedSecs * ratio);
+                        if (remSecsTotal > 0)
+                        {
+                            int remSeconds = (int) (remSecsTotal % 60);
+                            int remMinutes = ((int) (remSecsTotal / 60)) % 60;
+                            int remHours = (int) (remSecsTotal / (60 * 60));                                    
+                            string strETR = String.Format("{0:00}:{1:00}:{2:00}", remHours, remMinutes, remSeconds);
+                            cfg.WriteProgressBar("copying files:", strETR, percent, true);
+                        } else
+                        {
+                            cfg.WriteProgressBar("copying files:", "", percent, true);
+                        }
+                        watch.Start();
+                    }
+                }
+            }
+            if(!cfg.verboseMode)
+            {
+                //cfg.WriteProgressBar("copying files:", "                         ", 100, true);
+                cfg.addToLog("");
+            }
+            cfg.addToLog("copying files: finished.");
+            watch.Stop();
+            TimeSpan ts = watch.Elapsed;
+            string elapsedTime = String.Format("{0:00}:{1:00}:{2:00}.{3:00}",
+                ts.Hours, ts.Minutes, ts.Seconds,
+                ts.Milliseconds / 10);
+
+            if (this.cfg.useVss && tryWithVSS.Count > 0)
+            {
+                using (VssBackup vss = new VssBackup())
+                {
+                    vss.Setup(Path.GetPathRoot(tryWithVSS[0].Item1));
+                    
+                    foreach(Tuple<String, DestinationFile> x in tryWithVSS)
+                    {
+                        string snap_path = vss.GetSnapshotPath(x.Item1);
+                        try
+                        {
+                            //Alphaleonis.Win32.Filesystem.File.Copy(snap_path, x.Item2.driveTimeFilename);
+                            System.IO.File.Copy(snap_path, x.Item2.driveTimeFilename, overwrite: true);
+                            cfg.addToLog(x.Item1 + ": copied snapshot via VSS");
+                        } catch (ArgumentException e)
+                        {
+                            cfg.addToLog("ERR: " + x.Item1 + ": "+e.Message);
+                        } 
+                        catch (DirectoryNotFoundException e)
+                        {
+                            cfg.addToLog("ERR: " + x.Item1 + ": " + e.Message);
+                        } catch (FileNotFoundException e)
+                        {
+                            cfg.addToLog("ERR: " + x.Item1 + ": " + e.Message);
+                        } catch (IOException e)
+                        {
+                            cfg.addToLog("ERR: " + x.Item1 + ": " + e.Message);
+                        } catch (NotSupportedException e)
+                        {
+                            cfg.addToLog("ERR: " + x.Item1 + ": " + e.Message);
+                        } catch (UnauthorizedAccessException e)
+                        {
+                            cfg.addToLog("ERR: " + x.Item1 + ": " + e.Message);
+                        }
+                    }
+                }
+            }
+            this.cfg.addToLog("-----------------------------------------------------------------");
+        }
+
+        public DestinationFile createFileDestPath(string fileSourcePath, string destDrive)
+        {
+            if(destDrive.EndsWith(":"))
+            {
+                destDrive += "\\";
+            }
+            FileInfo f = new FileInfo(fileSourcePath);
+            string src_drive = Path.GetPathRoot(f.FullName);
+            string dest_file = fileSourcePath.Substring(src_drive.Length, fileSourcePath.Length - src_drive.Length);
+            string src_drive_clean = src_drive.Replace(':', '_').Replace('\\', '_');
+            DestinationFile df = new DestinationFile();
+            df.destDrive = destDrive;
+            df.timestamp = now;
+            df.fileName = Path.Combine(src_drive_clean, dest_file);
+            df.driveTimeFilename = Path.Combine(destDrive, now, src_drive_clean, dest_file);
+            return df;
+        }
+
+        public string createDirDestPath(string dirSourcePath, string destDrive)
+        {
+            if (destDrive.EndsWith(":"))
+            {
+                destDrive += "\\";
+            }
+            DirectoryInfo f = new DirectoryInfo(dirSourcePath);
+            string src_drive = Path.GetPathRoot(f.FullName);
+            string des_dir = dirSourcePath.Substring(src_drive.Length, dirSourcePath.Length - src_drive.Length);
+            string src_drive_clean = src_drive.Replace(':', '_').Replace('\\', '_');
+            return Path.Combine(destDrive, now, src_drive_clean, des_dir);
+        }
+
+
+        public bool Like(string str, string pattern)
+        {
+            return new Regex(
+                "^" + Regex.Escape(pattern).Replace(@"\*", ".*").Replace(@"\?", ".") + "$",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline
+            ).IsMatch(str);
+        }
+
+        bool IsDigitsOnly(string str)
+        {
+            foreach (char c in str)
+            {
+                if (c < '0' || c > '9')
+                    return false;
+            }
+
+            return true;
+        }
+
+        /*
+        [DllImport("Kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern bool CreateHardLink(
+        string lpFileName,
+        string lpExistingFileName,
+        IntPtr lpSecurityAttributes
+        );*/
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool CreateHardLink(
+        string lpFileName,
+        string lpExistingFileName,
+        IntPtr lpSecurityAttributes);
+    }
+}
